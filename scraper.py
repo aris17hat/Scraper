@@ -119,15 +119,43 @@ st.set_page_config(page_title="Web Scraper", page_icon="🔍", layout="wide")
 st.title("🔍 Scraper d'emails et réseaux sociaux")
 st.markdown("Importe une liste de sites, lance le scraping, télécharge les résultats.")
 
-# Upload
-uploaded_file = st.file_uploader("📂 Importe ton fichier CSV", type=["csv"])
+# ── Mode de saisie ──────────────────────────────────────────────
+st.markdown("### 📥 Comment veux-tu entrer les sites ?")
+mode = st.radio("", ["✏️ Saisie manuelle (1 à 10 sites)", "📂 Importer un fichier (CSV, Excel, TXT)"], horizontal=True)
 
-if uploaded_file:
-    df_input = pd.read_csv(uploaded_file)
-    st.success(f"✅ {len(df_input)} sites chargés")
+domains_input = []
 
-    col_name = st.selectbox("Quelle colonne contient les URLs ?", df_input.columns.tolist())
+if mode == "✏️ Saisie manuelle (1 à 10 sites)":
+    single = st.text_input("Un seul site", placeholder="ex: google.com")
+    multi = st.text_area("Ou jusqu'à 10 sites (un par ligne)", placeholder="google.com\nfacebook.com\ntwitter.com", height=150)
+    
+    if single.strip():
+        domains_input = [single.strip()]
+    elif multi.strip():
+        lines = [l.strip() for l in multi.strip().split('\n') if l.strip()]
+        if len(lines) > 10:
+            st.warning("⚠️ Maximum 10 sites en saisie manuelle. Seuls les 10 premiers seront traités.")
+            lines = lines[:10]
+        domains_input = lines
 
+else:
+    uploaded_file = st.file_uploader("📂 Importe ton fichier", type=["csv", "xlsx", "xls", "txt"])
+    if uploaded_file:
+        if uploaded_file.name.endswith('.txt'):
+            content = uploaded_file.read().decode('utf-8')
+            domains_input = [l.strip() for l in content.split('\n') if l.strip()]
+        elif uploaded_file.name.endswith('.csv'):
+            df_input = pd.read_csv(uploaded_file)
+            col_name = st.selectbox("Quelle colonne contient les URLs ?", df_input.columns.tolist())
+            domains_input = df_input[col_name].dropna().tolist()
+        else:
+            df_input = pd.read_excel(uploaded_file)
+            col_name = st.selectbox("Quelle colonne contient les URLs ?", df_input.columns.tolist())
+            domains_input = df_input[col_name].dropna().tolist()
+        st.success(f"✅ {len(domains_input)} sites chargés")
+
+# ── Paramètres communs ───────────────────────────────────────────
+if domains_input:
     # Mots-clés optionnels
     st.markdown("### 🎯 Filtrage par thématique (optionnel)")
     keywords_input = st.text_input(
@@ -139,7 +167,7 @@ if uploaded_file:
     max_concurrent = st.slider("Connexions simultanées", min_value=5, max_value=50, value=20)
 
     if st.button("🚀 Lancer le scraping"):
-        domains = df_input[col_name].dropna().apply(clean_domain).drop_duplicates().tolist()
+        domains = pd.Series(domains_input).apply(clean_domain).drop_duplicates().tolist()
         st.info(f"🔄 {len(domains)} sites uniques à scraper...")
 
         progress_bar = st.progress(0)
@@ -161,13 +189,11 @@ if uploaded_file:
                 return any(kw in title.lower() for kw in keywords)
             df_results = df_results[df_results['title'].apply(is_relevant)]
 
-        
         # Garder ceux avec au moins un contact
         social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
         has_contact = df_results['emails'].notna()
         if social_cols:
             has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
-
 
         df_results = df_results[has_contact].reset_index(drop=True)
 

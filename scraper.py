@@ -1,0 +1,193 @@
+import streamlit as st
+import asyncio
+import aiohttp
+import re
+import pandas as pd
+from bs4 import BeautifulSoup
+import io
+
+# ── Config ──────────────────────────────────────────────
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+EMAIL_BLACKLIST = [
+    'sentry.io', 'example.com', 'wixpress.com', 'domain.com',
+    '.js', '.css', '.png', '.jpg', 'min.js', 'sentry.okg'
+]
+
+SOCIAL_PATTERNS = {
+    'facebook':  r'(?:https?://)?(?:www\.)?facebook\.com/[\w.%-]+',
+    'instagram': r'(?:https?://)?(?:www\.)?instagram\.com/[\w.%-]+',
+    'twitter':   r'(?:https?://)?(?:www\.)?twitter\.com/[\w.%-]+',
+    'linkedin':  r'(?:https?://)?(?:www\.)?linkedin\.com/(?:company|in)/[\w.%-]+',
+    'tiktok':    r'(?:https?://)?(?:www\.)?tiktok\.com/@[\w.%-]+',
+    'youtube':   r'(?:https?://)?(?:www\.)?youtube\.com/(?:c/|channel/|@)[\w.-]+',
+}
+
+PAGES = ['/contact', '/contact-us', '/about', '/about-us', '/', '/a-propos', '/privacy-policy', '/terms-of-use', '/legal']
+
+# ── Fonctions ────────────────────────────────────────────
+def clean_domain(url):
+    url = str(url).strip()
+    url = re.sub(r'^https?://', '', url)
+    url = re.sub(r'^www\.', '', url)
+    url = url.rstrip('/')
+    return url
+
+def clean_emails(raw_emails):
+    cleaned = set()
+    for email in raw_emails:
+        email = email.strip().lower()
+        email = email.split('?')[0]  # enlève les paramètres d'URL
+        if re.search(r'u003e|u003c|\\', email):
+            continue
+        if any(bl in email for bl in EMAIL_BLACKLIST):
+            continue
+        cleaned.add(email)
+    return cleaned
+
+async def scrape_site(session, domain):
+    emails = set()
+    socials = {}
+    title = None
+
+    for base in [f"https://{domain}", f"https://www.{domain}"]:
+        for page in PAGES:
+            url = f"{base}{page}"
+            try:
+                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text(errors='ignore')
+                    soup = BeautifulSoup(html, 'lxml')
+
+                    if page == '/' and soup.title and title is None:
+                        t = soup.title.string
+                        if t:
+                            title = t.strip()
+                            if any(x in title for x in ['Just a moment', 'Access Denied', 'Attention Required']):
+                                title = None
+
+                    found_emails = re.findall(EMAIL_REGEX, html)
+                    emails.update(clean_emails(found_emails))
+
+                    for a in soup.find_all("a", href=True):
+                        if "mailto:" in a["href"]:
+                            email = a["href"].replace("mailto:", "").strip().lower().split('?')[0]
+                            emails.update(clean_emails([email]))
+
+                    for name, pattern in SOCIAL_PATTERNS.items():
+                        if name not in socials:
+                            match = re.search(pattern, html)
+                            if match:
+                                link = match.group()
+                                if not link.startswith('http'):
+                                    link = 'https://' + link
+                                socials[name] = link
+
+            except Exception:
+                continue
+
+        if emails or socials:
+            break
+
+    return {
+        'domain': domain,
+        'title': title,
+        'emails': ', '.join(emails) if emails else None,
+        **socials
+    }
+
+async def run_all(domains, max_concurrent, progress_callback):
+    results = []
+    connector = aiohttp.TCPConnector(limit=max_concurrent, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [scrape_site(session, domain) for domain in domains]
+        for i, coro in enumerate(asyncio.as_completed(tasks)):
+            result = await coro
+            results.append(result)
+            progress_callback(i + 1, len(domains))
+    return results
+
+# ── Interface Streamlit ──────────────────────────────────
+st.set_page_config(page_title="Web Scraper", page_icon="🔍", layout="wide")
+st.title("🔍 Scraper d'emails et réseaux sociaux")
+st.markdown("Importe une liste de sites, lance le scraping, télécharge les résultats.")
+
+# Upload
+uploaded_file = st.file_uploader("📂 Importe ton fichier CSV", type=["csv"])
+
+if uploaded_file:
+    df_input = pd.read_csv(uploaded_file)
+    st.success(f"✅ {len(df_input)} sites chargés")
+
+    col_name = st.selectbox("Quelle colonne contient les URLs ?", df_input.columns.tolist())
+
+    # Mots-clés optionnels
+    st.markdown("### 🎯 Filtrage par thématique (optionnel)")
+    keywords_input = st.text_input(
+        "Mots-clés séparés par des virgules (laisse vide pour tout garder)",
+        placeholder="ex: crypto, bitcoin, finance, trading"
+    )
+
+    # Paramètres
+    max_concurrent = st.slider("Connexions simultanées", min_value=5, max_value=50, value=20)
+
+    if st.button("🚀 Lancer le scraping"):
+        domains = df_input[col_name].dropna().apply(clean_domain).drop_duplicates().tolist()
+        st.info(f"🔄 {len(domains)} sites uniques à scraper...")
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        def progress_callback(current, total):
+            progress_bar.progress(current / total)
+            status_text.text(f"⏳ {current} / {total} sites traités")
+
+        results = asyncio.run(run_all(domains, max_concurrent, progress_callback))
+        df_results = pd.DataFrame(results)
+
+        # Filtrage par mots-clés
+        if keywords_input.strip():
+            keywords = [k.strip().lower() for k in keywords_input.split(',')]
+            def is_relevant(title):
+                if not title or str(title) == 'nan':
+                    return False
+                return any(kw in title.lower() for kw in keywords)
+            df_results = df_results[df_results['title'].apply(is_relevant)]
+
+        
+        # Garder ceux avec au moins un contact
+        social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
+        has_contact = df_results['emails'].notna()
+        if social_cols:
+            has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
+
+
+        df_results = df_results[has_contact].reset_index(drop=True)
+
+        st.success(f"✅ {len(df_results)} sites avec contacts trouvés !")
+
+        # Résumé
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("📧 Emails", df_results['emails'].notna().sum())
+        col2.metric("💼 LinkedIn", df_results['linkedin'].notna().sum() if 'linkedin' in df_results.columns else 0)
+        col3.metric("▶️ YouTube", df_results['youtube'].notna().sum() if 'youtube' in df_results.columns else 0)
+        col4.metric("🐦 Twitter", df_results['twitter'].notna().sum() if 'twitter' in df_results.columns else 0)
+
+        st.dataframe(df_results)
+
+        # Export
+        csv_buffer = io.StringIO()
+        df_results.to_csv(csv_buffer, index=False)
+        st.download_button(
+            label="⬇️ Télécharger les résultats CSV",
+            data=csv_buffer.getvalue(),
+            file_name="resultats_scraping.csv",
+            mime="text/csv"
+        )

@@ -157,39 +157,32 @@ else:
 
 # ── Paramètres communs ───────────────────────────────────────────
 if domains_input:
-    # Mots-clés optionnels
-    st.markdown("### 🎯 Filtrage par thématique (optionnel)")
-    keywords_input = st.text_input(
-        "Mots-clés séparés par des virgules (laisse vide pour tout garder)",
-        placeholder="ex: crypto, bitcoin, finance, trading"
-    )
 
-    # Paramètres
-    max_concurrent = st.slider("Connexions simultanées", min_value=5, max_value=50, value=20)
+    max_concurrent = 20
 
     if st.button("🚀 Lancer le scraping"):
-    domains = pd.Series(domains_input).apply(clean_domain).drop_duplicates().tolist()
-    st.info(f"🔄 {len(domains)} sites uniques à scraper...")
+        domains = pd.Series(domains_input).apply(clean_domain).drop_duplicates().tolist()
+        st.info(f"🔄 {len(domains)} sites uniques à scraper...")
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-    def progress_callback(current, total):
-        progress_bar.progress(current / total)
-        status_text.text(f"⏳ {current} / {total} sites traités")
+        def progress_callback(current, total):
+            progress_bar.progress(current / total)
+            status_text.text(f"⏳ {current} / {total} sites traités")
 
-    results = asyncio.run(run_all(domains, max_concurrent, progress_callback))
-    df_results = pd.DataFrame(results)
+        results = asyncio.run(run_all(domains, max_concurrent, progress_callback))
+        df_results = pd.DataFrame(results)
 
-    # Garder ceux avec au moins un contact
-    social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
-    has_contact = df_results['emails'].notna()
-    if social_cols:
-        has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
-    df_results = df_results[has_contact].reset_index(drop=True)
+        # Garder ceux avec au moins un contact
+        social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
+        has_contact = df_results['emails'].notna()
+        if social_cols:
+            has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
+        df_results = df_results[has_contact].reset_index(drop=True)
 
-    # Mémoriser les résultats dans session_state
-    st.session_state['df_results'] = df_results
+        # Mémoriser les résultats
+        st.session_state['df_results'] = df_results
 
 # ── Affichage des résultats si disponibles ───────────────────────
 if 'df_results' in st.session_state:

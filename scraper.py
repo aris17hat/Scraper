@@ -168,53 +168,114 @@ if domains_input:
     max_concurrent = st.slider("Connexions simultanées", min_value=5, max_value=50, value=20)
 
     if st.button("🚀 Lancer le scraping"):
-        domains = pd.Series(domains_input).apply(clean_domain).drop_duplicates().tolist()
-        st.info(f"🔄 {len(domains)} sites uniques à scraper...")
+    domains = pd.Series(domains_input).apply(clean_domain).drop_duplicates().tolist()
+    st.info(f"🔄 {len(domains)} sites uniques à scraper...")
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-        def progress_callback(current, total):
-            progress_bar.progress(current / total)
-            status_text.text(f"⏳ {current} / {total} sites traités")
+    def progress_callback(current, total):
+        progress_bar.progress(current / total)
+        status_text.text(f"⏳ {current} / {total} sites traités")
 
-        results = asyncio.run(run_all(domains, max_concurrent, progress_callback))
-        df_results = pd.DataFrame(results)
+    results = asyncio.run(run_all(domains, max_concurrent, progress_callback))
+    df_results = pd.DataFrame(results)
 
-        # Filtrage par mots-clés
-        if keywords_input.strip():
-            keywords = [k.strip().lower() for k in keywords_input.split(',')]
+    # Garder ceux avec au moins un contact
+    social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
+    has_contact = df_results['emails'].notna()
+    if social_cols:
+        has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
+    df_results = df_results[has_contact].reset_index(drop=True)
+
+    # Mémoriser les résultats dans session_state
+    st.session_state['df_results'] = df_results
+
+# ── Affichage des résultats si disponibles ───────────────────────
+if 'df_results' in st.session_state:
+    df_results = st.session_state['df_results']
+
+    # Stats résumées uniquement
+    st.success(f"✅ {len(df_results)} sites avec contacts trouvés !")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📧 Emails", df_results['emails'].notna().sum())
+    col2.metric("💼 LinkedIn", df_results['linkedin'].notna().sum() if 'linkedin' in df_results.columns else 0)
+    col3.metric("▶️ YouTube", df_results['youtube'].notna().sum() if 'youtube' in df_results.columns else 0)
+    col4.metric("🐦 Twitter", df_results['twitter'].notna().sum() if 'twitter' in df_results.columns else 0)
+
+    # ── Filtrage post-scraping ───────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🎯 Filtrer les résultats")
+
+    filter_choice = st.radio(
+        "Que veux-tu télécharger ?",
+        ["📥 Tout télécharger sans filtre", "🔍 Filtrer par thématique"],
+        horizontal=True
+    )
+
+    if filter_choice == "🔍 Filtrer par thématique":
+        from collections import Counter
+        import string
+
+        STOP_WORDS = {
+            'the','and','for','with','your','our','all','from','this','that',
+            'are','was','not','but','have','has','more','than','its','their',
+            'can','will','you','we','de','la','le','les','des','du','en','un',
+            'une','et','est','par','sur','dans','qui','que','pour','plus','avec',
+            'au','aux','se','son','sa','ils','elle','il','on','si','ne','pas',
+            'how','what','why','when','where','get','top','best','free','new',
+            'about','news','latest','online','home','page','site','web','www'
+        }
+
+        all_titles = df_results['title'].dropna().tolist()
+        words = []
+        for title in all_titles:
+            for word in title.lower().split():
+                word = word.strip(string.punctuation)
+                if len(word) > 3 and word not in STOP_WORDS:
+                    words.append(word)
+
+        top_words = [word for word, count in Counter(words).most_common(30)]
+
+        st.markdown("**💡 Mots-clés suggérés** (extraits automatiquement des titres) :")
+        selected_tags = st.multiselect(
+            "Sélectionne un ou plusieurs mots-clés :",
+            options=top_words,
+            default=[]
+        )
+
+        manual_keywords = st.text_input(
+            "➕ Ajoute tes propres mots-clés (séparés par des virgules)",
+            placeholder="ex: igaming, casino, cbd, crypto"
+        )
+
+        all_keywords = list(selected_tags)
+        if manual_keywords.strip():
+            all_keywords += [k.strip().lower() for k in manual_keywords.split(',') if k.strip()]
+
+        if all_keywords:
             def is_relevant(title):
                 if not title or str(title) == 'nan':
                     return False
-                return any(kw in title.lower() for kw in keywords)
-            df_results = df_results[df_results['title'].apply(is_relevant)]
+                return any(kw in title.lower() for kw in all_keywords)
 
-        # Garder ceux avec au moins un contact
-        social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
-        has_contact = df_results['emails'].notna()
-        if social_cols:
-            has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
+            df_filtered = df_results[df_results['title'].apply(is_relevant)].reset_index(drop=True)
+            st.info(f"🔍 {len(df_filtered)} sites correspondent à tes filtres")
+            st.dataframe(df_filtered)
+            df_to_export = df_filtered
+        else:
+            st.warning("Sélectionne au moins un mot-clé pour filtrer.")
+            df_to_export = df_results
 
-        df_results = df_results[has_contact].reset_index(drop=True)
+    else:
+        df_to_export = df_results
 
-        st.success(f"✅ {len(df_results)} sites avec contacts trouvés !")
-
-        # Résumé
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("📧 Emails", df_results['emails'].notna().sum())
-        col2.metric("💼 LinkedIn", df_results['linkedin'].notna().sum() if 'linkedin' in df_results.columns else 0)
-        col3.metric("▶️ YouTube", df_results['youtube'].notna().sum() if 'youtube' in df_results.columns else 0)
-        col4.metric("🐦 Twitter", df_results['twitter'].notna().sum() if 'twitter' in df_results.columns else 0)
-
-        st.dataframe(df_results)
-
-        # Export
-        csv_buffer = io.StringIO()
-        df_results.to_csv(csv_buffer, index=False)
-        st.download_button(
-            label="⬇️ Télécharger les résultats CSV",
-            data=csv_buffer.getvalue(),
-            file_name="resultats_scraping.csv",
-            mime="text/csv"
-        )
+    # ── Export final ─────────────────────────────────────────────
+    csv_buffer = io.StringIO()
+    df_to_export.to_csv(csv_buffer, index=False)
+    st.download_button(
+        label="⬇️ Télécharger les résultats CSV",
+        data=csv_buffer.getvalue(),
+        file_name="resultats_scraping.csv",
+        mime="text/csv"
+    )

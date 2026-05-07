@@ -1,6 +1,7 @@
-openpyxl
-streamlit
+fastapi
+uvicorn
 aiohttp
 beautifulsoup4
 lxml
 pandas
+playwright

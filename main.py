@@ -8,6 +8,7 @@ import json
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from typing import List
+from urllib.parse import urlparse
 
 app = FastAPI()
 
@@ -53,6 +54,18 @@ OBFUSCATION_PATTERNS = [
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────
+def extract_domain_and_path(url):
+    """Retourne (domain, custom_path) si l'URL contient un chemin spécifique"""
+    url = str(url).strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+    parsed = urlparse(url)
+    domain = re.sub(r'^www\.', '', parsed.netloc)
+    path = parsed.path.rstrip('/')
+    if path and path != '/':
+        return domain, path
+    return domain, None
+
 def deobfuscate(text):
     for pattern, replacement in OBFUSCATION_PATTERNS:
         text = re.sub(pattern, replacement, text)
@@ -74,30 +87,23 @@ def extract_from_html(html, soup):
     socials = {}
     title = None
 
-    # Titre
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
         if any(x in title for x in ['Just a moment', 'Access Denied', 'Attention Required']):
             title = None
 
-    # Déobfuscation
     html_deob = deobfuscate(html)
-
-    # Emails via regex
     emails.update(clean_emails(re.findall(EMAIL_REGEX, html_deob)))
 
-    # Emails via mailto
     for a in soup.find_all("a", href=True):
         if "mailto:" in a["href"]:
             email = a["href"].replace("mailto:", "").strip().lower().split('?')[0]
             emails.update(clean_emails([email]))
 
-    # Emails dans le footer
     footer = soup.find('footer')
     if footer:
         emails.update(clean_emails(re.findall(EMAIL_REGEX, deobfuscate(footer.get_text()))))
 
-    # Emails dans JSON-LD
     for script in soup.find_all('script', type='application/ld+json'):
         try:
             data = json.loads(script.string)
@@ -106,7 +112,6 @@ def extract_from_html(html, soup):
         except Exception:
             pass
 
-    # Réseaux sociaux
     for name, pattern in SOCIAL_PATTERNS.items():
         match = re.search(pattern, html)
         if match:
@@ -118,13 +123,15 @@ def extract_from_html(html, soup):
     return title, emails, socials
 
 # ── Pass 1 : Fast mode (aiohttp) ──────────────────────────────────
-async def scrape_fast(session, domain):
+async def scrape_fast(session, domain, extra_pages=None):
     emails = set()
     socials = {}
     title = None
 
+    pages_to_visit = (extra_pages or []) + PAGES
+
     for base in [f"https://{domain}", f"https://www.{domain}"]:
-        for page in PAGES:
+        for page in pages_to_visit:
             url = f"{base}{page}"
             try:
                 async with session.get(url, headers=HEADERS,
@@ -148,10 +155,12 @@ async def scrape_fast(session, domain):
     return title, emails, socials
 
 # ── Pass 2 : Deep mode (Playwright) ──────────────────────────────
-async def scrape_playwright(domain):
+async def scrape_playwright(domain, extra_pages=None):
     emails = set()
     socials = {}
     title = None
+
+    pages_to_visit = (extra_pages or []) + PAGES
 
     try:
         async with async_playwright() as p:
@@ -163,7 +172,7 @@ async def scrape_playwright(domain):
             page = await context.new_page()
 
             for base in [f"https://{domain}", f"https://www.{domain}"]:
-                for pg in PAGES:
+                for pg in pages_to_visit:
                     url = f"{base}{pg}"
                     try:
                         await page.goto(url, timeout=20000, wait_until="networkidle")
@@ -188,16 +197,19 @@ async def scrape_playwright(domain):
     return title, emails, socials
 
 # ── Scraper principal ─────────────────────────────────────────────
-async def scrape_site(session, domain):
-    title, emails, socials = await scrape_fast(session, domain)
+async def scrape_site(session, domain_input):
+    domain, custom_path = extract_domain_and_path(domain_input)
+    extra_pages = [custom_path] if custom_path else None
+
+    title, emails, socials = await scrape_fast(session, domain, extra_pages)
 
     scrape_method = "fast"
     if not emails and not socials:
-        title, emails, socials = await scrape_playwright(domain)
+        title, emails, socials = await scrape_playwright(domain, extra_pages)
         scrape_method = "playwright"
 
     return {
-        "domain": domain,
+        "domain": domain_input,
         "title": title,
         "emails": ", ".join(emails) if emails else None,
         "scrape_method": scrape_method,
@@ -210,11 +222,18 @@ class ScrapeRequest(BaseModel):
 
 @app.post("/api/scrape")
 async def scrape(request: ScrapeRequest):
+    batch_size = 50
+    all_results = []
+
     connector = aiohttp.TCPConnector(limit=20, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [scrape_site(session, domain) for domain in request.domains]
-        results = await asyncio.gather(*tasks)
-    return {"results": list(results)}
+        for i in range(0, len(request.domains), batch_size):
+            batch = request.domains[i:i + batch_size]
+            tasks = [scrape_site(session, domain) for domain in batch]
+            results = await asyncio.gather(*tasks)
+            all_results.extend(results)
+
+    return {"results": all_results}
 
 @app.get("/")
 def health():

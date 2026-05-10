@@ -6,6 +6,8 @@ import re
 import pandas as pd
 from bs4 import BeautifulSoup
 import io
+import json
+from urllib.parse import urlparse
 
 # ── Config ──────────────────────────────────────────────
 HEADERS = {
@@ -30,21 +32,45 @@ SOCIAL_PATTERNS = {
     'youtube':   r'(?:https?://)?(?:www\.)?youtube\.com/(?:c/|channel/|@)[\w.-]+',
 }
 
-PAGES = ['/contact', '/contact-us', '/about', '/about-us', '/', '/a-propos', '/privacy-policy', '/terms-of-use', '/legal']
+OBFUSCATION_PATTERNS = [
+    (r'([a-zA-Z0-9._%+-]+)\s*\[at\]\s*([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r'\1@\2'),
+    (r'([a-zA-Z0-9._%+-]+)\s*\(at\)\s*([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r'\1@\2'),
+    (r'([a-zA-Z0-9._%+-]+)\s*\(arobase\)\s*([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r'\1@\2'),
+    (r'([a-zA-Z0-9._%+-]+)\s+AT\s+([a-zA-Z0-9.-]+)\s+DOT\s+([a-zA-Z]{2,})', r'\1@\2.\3'),
+    (r'([a-zA-Z0-9._%+-]+)\s*@\s*([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', r'\1@\2'),
+]
 
-# ── Fonctions ────────────────────────────────────────────
-def clean_domain(url):
+PAGES = ['/contact', '/contact-us', '/about', '/about-us', '/', '/a-propos',
+         '/privacy-policy', '/terms-of-use', '/legal', '/mentions-legales',
+         '/politique-de-confidentialite', '/mentions-lgales',
+         '/mentions-legales-et-rgpd', '/mentions-legales-rgpd',
+         '/conditions-generales-dutilisation', '/cgu', '/rgpd']
+
+# ── Helpers ──────────────────────────────────────────────
+def extract_domain_and_path(url):
     url = str(url).strip()
-    url = re.sub(r'^https?://', '', url)
-    url = re.sub(r'^www\.', '', url)
-    url = url.rstrip('/')
-    return url
+    if not url.startswith('http'):
+        url = 'https://' + url
+    parsed = urlparse(url)
+    domain = re.sub(r'^www\.', '', parsed.netloc)
+    path = parsed.path.rstrip('/')
+    if path and path != '/':
+        return domain, path
+    return domain, None
+
+def clean_domain(url):
+    domain, _ = extract_domain_and_path(url)
+    return domain
+
+def deobfuscate(text):
+    for pattern, replacement in OBFUSCATION_PATTERNS:
+        text = re.sub(pattern, replacement, text)
+    return text
 
 def clean_emails(raw_emails):
     cleaned = set()
     for email in raw_emails:
-        email = email.strip().lower()
-        email = email.split('?')[0]  # enlève les paramètres d'URL
+        email = email.strip().lower().split('?')[0]
         if re.search(r'u003e|u003c|\\', email):
             continue
         if any(bl in email for bl in EMAIL_BLACKLIST):
@@ -52,48 +78,74 @@ def clean_emails(raw_emails):
         cleaned.add(email)
     return cleaned
 
-async def scrape_site(session, domain):
+def extract_from_html(html, soup):
+    emails = set()
+    socials = {}
+    title = None
+
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+        if any(x in title for x in ['Just a moment', 'Access Denied', 'Attention Required']):
+            title = None
+
+    html_deob = deobfuscate(html)
+    emails.update(clean_emails(re.findall(EMAIL_REGEX, html_deob)))
+
+    for a in soup.find_all("a", href=True):
+        if "mailto:" in a["href"]:
+            email = a["href"].replace("mailto:", "").strip().lower().split('?')[0]
+            emails.update(clean_emails([email]))
+
+    footer = soup.find('footer')
+    if footer:
+        emails.update(clean_emails(re.findall(EMAIL_REGEX, deobfuscate(footer.get_text()))))
+
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string)
+            text = json.dumps(data)
+            emails.update(clean_emails(re.findall(EMAIL_REGEX, text)))
+        except Exception:
+            pass
+
+    for name, pattern in SOCIAL_PATTERNS.items():
+        match = re.search(pattern, html)
+        if match:
+            link = match.group()
+            if not link.startswith('http'):
+                link = 'https://' + link
+            socials[name] = link
+
+    return title, emails, socials
+
+# ── Scraping ──────────────────────────────────────────────
+async def scrape_site(session, domain_input):
+    domain, custom_path = extract_domain_and_path(domain_input)
+    pages_to_visit = ([custom_path] if custom_path else []) + PAGES
+
     emails = set()
     socials = {}
     title = None
 
     for base in [f"https://{domain}", f"https://www.{domain}"]:
-        for page in PAGES:
+        for page in pages_to_visit:
             url = f"{base}{page}"
             try:
-                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(url, headers=HEADERS,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
                         continue
                     html = await resp.text(errors='ignore')
                     soup = BeautifulSoup(html, 'lxml')
-
-                    if page == '/' and soup.title and title is None:
-                        t = soup.title.string
-                        if t:
-                            title = t.strip()
-                            if any(x in title for x in ['Just a moment', 'Access Denied', 'Attention Required']):
-                                title = None
-
-                    found_emails = re.findall(EMAIL_REGEX, html)
-                    emails.update(clean_emails(found_emails))
-
-                    for a in soup.find_all("a", href=True):
-                        if "mailto:" in a["href"]:
-                            email = a["href"].replace("mailto:", "").strip().lower().split('?')[0]
-                            emails.update(clean_emails([email]))
-
-                    for name, pattern in SOCIAL_PATTERNS.items():
-                        if name not in socials:
-                            match = re.search(pattern, html)
-                            if match:
-                                link = match.group()
-                                if not link.startswith('http'):
-                                    link = 'https://' + link
-                                socials[name] = link
-
+                    t, e, s = extract_from_html(html, soup)
+                    if t and not title:
+                        title = t
+                    emails.update(e)
+                    for k, v in s.items():
+                        if k not in socials:
+                            socials[k] = v
             except Exception:
                 continue
-
         if emails or socials:
             break
 
@@ -110,7 +162,10 @@ async def run_all(domains, max_concurrent, progress_callback):
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [scrape_site(session, domain) for domain in domains]
         for i, coro in enumerate(asyncio.as_completed(tasks)):
-            result = await coro
+            try:
+                result = await asyncio.wait_for(coro, timeout=60)
+            except Exception:
+                result = {'domain': domains[i], 'title': None, 'emails': None}
             results.append(result)
             progress_callback(i + 1, len(domains))
     return results
@@ -120,7 +175,6 @@ st.set_page_config(page_title="Web Scraper", page_icon="🔍", layout="wide")
 st.title("🔍 Scraper d'emails et réseaux sociaux")
 st.markdown("Importe une liste de sites, lance le scraping, télécharge les résultats.")
 
-# ── Mode de saisie ──────────────────────────────────────────────
 st.markdown("### 📥 Comment veux-tu entrer les sites ?")
 mode = st.radio("", ["✏️ Saisie manuelle (1 à 10 sites)", "📂 Importer un fichier (CSV, Excel, TXT)"], horizontal=True)
 
@@ -129,7 +183,6 @@ domains_input = []
 if mode == "✏️ Saisie manuelle (1 à 10 sites)":
     single = st.text_input("Un seul site", placeholder="ex: google.com")
     multi = st.text_area("Ou jusqu'à 10 sites (un par ligne)", placeholder="google.com\nfacebook.com\ntwitter.com", height=150)
-    
     if single.strip():
         domains_input = [single.strip()]
     elif multi.strip():
@@ -138,7 +191,6 @@ if mode == "✏️ Saisie manuelle (1 à 10 sites)":
             st.warning("⚠️ Maximum 10 sites en saisie manuelle. Seuls les 10 premiers seront traités.")
             lines = lines[:10]
         domains_input = lines
-
 else:
     uploaded_file = st.file_uploader("📂 Importe ton fichier", type=["csv", "xlsx", "xls", "txt"])
     if uploaded_file:
@@ -155,9 +207,7 @@ else:
             domains_input = df_input[col_name].dropna().tolist()
         st.success(f"✅ {len(domains_input)} sites chargés")
 
-# ── Paramètres communs ───────────────────────────────────────────
 if domains_input:
-
     max_concurrent = 20
 
     if st.button("🚀 Lancer le scraping"):
@@ -174,21 +224,17 @@ if domains_input:
         results = asyncio.run(run_all(domains, max_concurrent, progress_callback))
         df_results = pd.DataFrame(results)
 
-        # Garder ceux avec au moins un contact
         social_cols = [c for c in ['facebook','instagram','linkedin','youtube','twitter','tiktok'] if c in df_results.columns]
         has_contact = df_results['emails'].notna()
         if social_cols:
             has_contact = has_contact | df_results[social_cols].notna().any(axis=1)
         df_results = df_results[has_contact].reset_index(drop=True)
 
-        # Mémoriser les résultats
         st.session_state['df_results'] = df_results
 
-# ── Affichage des résultats si disponibles ───────────────────────
 if 'df_results' in st.session_state:
     df_results = st.session_state['df_results']
 
-    # Stats résumées uniquement
     st.success(f"✅ {len(df_results)} sites avec contacts trouvés !")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("📧 Emails", df_results['emails'].notna().sum())
@@ -196,7 +242,11 @@ if 'df_results' in st.session_state:
     col3.metric("▶️ YouTube", df_results['youtube'].notna().sum() if 'youtube' in df_results.columns else 0)
     col4.metric("🐦 Twitter", df_results['twitter'].notna().sum() if 'twitter' in df_results.columns else 0)
 
-    # ── Filtrage post-scraping ───────────────────────────────────
+    # ── Tableau des résultats ────────────────────────────
+    st.markdown("### 📊 Résultats")
+    st.dataframe(df_results, use_container_width=True)
+
+    # ── Filtrage ─────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 🎯 Filtrer les résultats")
 
@@ -254,21 +304,24 @@ if 'df_results' in st.session_state:
 
             df_filtered = df_results[df_results['title'].apply(is_relevant)].reset_index(drop=True)
             st.info(f"🔍 {len(df_filtered)} sites correspondent à tes filtres")
-            st.dataframe(df_filtered)
+            st.dataframe(df_filtered, use_container_width=True)
             df_to_export = df_filtered
         else:
             st.warning("Sélectionne au moins un mot-clé pour filtrer.")
             df_to_export = df_results
-
     else:
         df_to_export = df_results
 
-    # ── Export final ─────────────────────────────────────────────
+    # ── Export avec nom personnalisé ─────────────────────
+    st.markdown("---")
+    file_name = st.text_input("📝 Nom du fichier à télécharger", value="resultats_scraping")
+    file_name = file_name.strip().replace(" ", "_") or "resultats_scraping"
+
     csv_buffer = io.StringIO()
     df_to_export.to_csv(csv_buffer, index=False)
     st.download_button(
         label="⬇️ Télécharger les résultats CSV",
         data=csv_buffer.getvalue(),
-        file_name="resultats_scraping.csv",
+        file_name=f"{file_name}.csv",
         mime="text/csv"
     )
